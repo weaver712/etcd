@@ -23,11 +23,15 @@ import (
 
 	"go.etcd.io/etcd/proxy/tcpproxy"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/spf13/cast"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
 var (
+	hotConfigFile                string
 	gatewayListenAddr            string
 	gatewayEndpoints             []string
 	gatewayDNSCluster            string
@@ -43,9 +47,11 @@ var (
 		Short:      "etcd server",
 		SuggestFor: []string{"etcd"},
 	}
+	tp *tcpproxy.TCPProxy = nil
 )
 
 func init() {
+	cobra.OnInitialize(initConfig)
 	rootCmd.AddCommand(newGatewayCommand())
 }
 
@@ -67,17 +73,55 @@ func newGatewayStartCommand() *cobra.Command {
 		Run:   startGateway,
 	}
 
+	cmd.Flags().StringVar(&hotConfigFile, "hot-config-file", "gateway.yaml", "config file")
 	cmd.Flags().StringVar(&gatewayListenAddr, "listen-addr", "127.0.0.1:23790", "listen address")
 	cmd.Flags().StringVar(&gatewayDNSCluster, "discovery-srv", "", "DNS domain used to bootstrap initial cluster")
 	cmd.Flags().StringVar(&gatewayDNSClusterServiceName, "discovery-srv-name", "", "service name to query when using DNS discovery")
 	cmd.Flags().BoolVar(&gatewayInsecureDiscovery, "insecure-discovery", false, "accept insecure SRV records")
 	cmd.Flags().StringVar(&gatewayCA, "trusted-ca-file", "", "path to the client server TLS CA file.")
 
-	cmd.Flags().StringSliceVar(&gatewayEndpoints, "endpoints", []string{"127.0.0.1:2379"}, "comma separated etcd cluster endpoints")
-
 	cmd.Flags().DurationVar(&getewayRetryDelay, "retry-delay", time.Minute, "duration of delay before retrying failed endpoints")
 
 	return &cmd
+}
+
+func loadHotConfig() {
+	if err := viper.ReadInConfig(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+
+	endpoints := viper.Get("endpoints")
+	if endpoints == nil {
+		fmt.Fprintln(os.Stderr, "load endpoints failed.")
+		return
+	}
+
+	gatewayEndpoints = cast.ToStringSlice(endpoints)
+	if 0 == len(gatewayEndpoints) {
+		fmt.Fprintln(os.Stderr, "endpoints is empty.")
+		os.Exit(1)
+		return
+	}
+
+	fmt.Printf("load endpoints:%v\n", gatewayEndpoints)
+
+	if tp != nil {
+		tp.Update(gatewayEndpoints)
+	}
+}
+
+func initConfig() {
+	viper.SetConfigFile(hotConfigFile)
+
+	loadHotConfig()
+
+	viper.OnConfigChange(func(in fsnotify.Event) {
+		loadHotConfig()
+	})
+	viper.WatchConfig()
+
+	fmt.Println("Using hot config file:", viper.ConfigFileUsed())
 }
 
 func stripSchema(eps []string) []string {
@@ -105,23 +149,8 @@ func startGateway(cmd *cobra.Command, args []string) {
 		srvs.Endpoints = gatewayEndpoints
 	}
 	// Strip the schema from the endpoints because we start just a TCP proxy
-	srvs.Endpoints = stripSchema(srvs.Endpoints)
-	if len(srvs.SRVs) == 0 {
-		for _, ep := range srvs.Endpoints {
-			h, p, serr := net.SplitHostPort(ep)
-			if serr != nil {
-				fmt.Printf("error parsing endpoint %q", ep)
-				os.Exit(1)
-			}
-			var port uint16
-			fmt.Sscanf(p, "%d", &port)
-			srvs.SRVs = append(srvs.SRVs, &net.SRV{Target: h, Port: port})
-		}
-	}
-
-	if len(srvs.Endpoints) == 0 {
-		fmt.Println("no endpoints found")
-		os.Exit(1)
+	if 0 == len(srvs.SRVs) {
+		srvs.SRVs = parseEndpoints(srvs.Endpoints)
 	}
 
 	var l net.Listener
@@ -131,7 +160,7 @@ func startGateway(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	tp := tcpproxy.TCPProxy{
+	tp = &tcpproxy.TCPProxy{
 		Logger:          lg,
 		Listener:        l,
 		Endpoints:       srvs.SRVs,
@@ -142,4 +171,25 @@ func startGateway(cmd *cobra.Command, args []string) {
 	notifySystemd(lg)
 
 	tp.Run()
+}
+
+func parseEndpoints(endpoints []string) []*net.SRV {
+	var srvs []*net.SRV
+	endpoints = stripSchema(endpoints)
+	for _, ep := range endpoints {
+		h, p, serr := net.SplitHostPort(ep)
+		if serr != nil {
+			fmt.Printf("error parsing endpoint %q", ep)
+			os.Exit(1)
+		}
+		var port uint16
+		fmt.Sscanf(p, "%d", &port)
+		srvs = append(srvs, &net.SRV{Target: h, Port: port})
+	}
+
+	if len(endpoints) == 0 {
+		fmt.Println("no endpoints found")
+		os.Exit(1)
+	}
+	return srvs
 }

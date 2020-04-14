@@ -19,6 +19,8 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -70,10 +72,15 @@ type TCPProxy struct {
 	mu        sync.Mutex // guards the following fields
 	remotes   []*remote
 	pickCount int // for round robin
+
+	cancelSig  [2]chan struct{}
+	busyConn   map[net.Conn]struct{}
+	busyConnMu sync.Mutex
 }
 
 func (tp *TCPProxy) Run() error {
 	tp.donec = make(chan struct{})
+	tp.busyConn = make(map[net.Conn]struct{})
 	if tp.MonitorInterval == 0 {
 		tp.MonitorInterval = 5 * time.Minute
 	}
@@ -166,6 +173,7 @@ func (tp *TCPProxy) serve(in net.Conn) {
 		out net.Conn
 	)
 
+	var backendConn net.Conn
 	for {
 		tp.mu.Lock()
 		remote := tp.pick()
@@ -176,6 +184,7 @@ func (tp *TCPProxy) serve(in net.Conn) {
 		// TODO: add timeout
 		out, err = net.Dial("tcp", remote.addr)
 		if err == nil {
+			backendConn = out
 			break
 		}
 		remote.inactivate()
@@ -186,20 +195,36 @@ func (tp *TCPProxy) serve(in net.Conn) {
 		}
 	}
 
+	tp.busyConnMu.Lock()
+	tp.busyConn[backendConn] = struct{}{}
+	tp.busyConnMu.Unlock()
+
 	if out == nil {
 		in.Close()
+		tp.busyConnMu.Lock()
+		delete(tp.busyConn, backendConn)
+		tp.busyConnMu.Unlock()
 		return
 	}
 
 	go func() {
 		io.Copy(in, out)
+		fmt.Println("stage 3")
 		in.Close()
 		out.Close()
+		tp.busyConnMu.Lock()
+		delete(tp.busyConn, backendConn)
+		tp.busyConnMu.Unlock()
 	}()
 
+	fmt.Println("stage 1")
 	io.Copy(out, in)
+	fmt.Println("stage 2")
 	out.Close()
 	in.Close()
+	tp.busyConnMu.Lock()
+	delete(tp.busyConn, backendConn)
+	tp.busyConnMu.Unlock()
 }
 
 func (tp *TCPProxy) runMonitor() {
@@ -239,4 +264,128 @@ func (tp *TCPProxy) Stop() {
 	// shutdown current connections?
 	tp.Listener.Close()
 	close(tp.donec)
+}
+
+func (tp *TCPProxy) runPendingHandler(pendingDelRemoteAddrs []string,
+	cancelSig <-chan struct{},
+	cancelOkSig chan<- struct{}) {
+	checkTimer := time.NewTimer(time.Millisecond * 1)
+	for {
+		select {
+		case <-checkTimer.C:
+			tp.mu.Lock()
+			for i, addr := range pendingDelRemoteAddrs {
+				isBusy := false
+				tp.busyConnMu.Lock()
+				for conn, _ := range tp.busyConn {
+					if conn != nil && (conn.RemoteAddr().String() == addr) {
+						isBusy = true
+					}
+				}
+				tp.busyConnMu.Unlock()
+				if !isBusy {
+					for idx, remote := range tp.remotes {
+						if remote.addr == addr {
+							fmt.Printf("del remote:%v\n", remote.addr)
+							tp.remotes = append(tp.remotes[:idx], tp.remotes[idx+1:]...)
+							pendingDelRemoteAddrs = append(pendingDelRemoteAddrs[:i], pendingDelRemoteAddrs[i+1:]...)
+							break
+						}
+					}
+				} else {
+					fmt.Printf("endpoint %v is busy, go to retry\n", addr)
+				}
+			}
+			tp.mu.Unlock()
+			if 0 < len(pendingDelRemoteAddrs) {
+				checkTimer.Reset(time.Second * 1)
+			}
+		case <-cancelSig:
+			close(cancelOkSig)
+			return
+		}
+	}
+}
+
+func stripSchema(eps []string) []string {
+	var endpoints []string
+	for _, ep := range eps {
+		if u, err := url.Parse(ep); err == nil && u.Host != "" {
+			ep = u.Host
+		}
+		endpoints = append(endpoints, ep)
+	}
+	return endpoints
+}
+
+func parseEndpoint(endpoint string) *net.SRV {
+	var srvs []*net.SRV
+	endpoints := stripSchema([]string{endpoint})
+	for _, ep := range endpoints {
+		h, p, serr := net.SplitHostPort(ep)
+		if serr != nil {
+			fmt.Printf("error parsing endpoint %q", ep)
+			os.Exit(1)
+		}
+		var port uint16
+		fmt.Sscanf(p, "%d", &port)
+		srvs = append(srvs, &net.SRV{Target: h, Port: port})
+	}
+
+	if len(endpoints) == 0 {
+		fmt.Println("no endpoints found")
+		os.Exit(1)
+	}
+	return srvs[0]
+}
+
+func (tp *TCPProxy) Update(endpoints []string) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	if len(tp.remotes) == 0 {
+		return
+	}
+
+	if tp.cancelSig[0] != nil {
+		close(tp.cancelSig[0])
+		<-tp.cancelSig[1]
+	}
+
+	var addList []string
+	var delList []string
+	for _, newEndpoint := range endpoints {
+		find := false
+		for _, remote := range tp.remotes {
+			if remote.addr == newEndpoint {
+				find = true
+				break
+			}
+		}
+		if !find {
+			addList = append(addList, newEndpoint)
+		}
+	}
+	fmt.Printf("addList:%v\n", addList)
+	for _, remote := range tp.remotes {
+		find := false
+		for _, newEndpoint := range endpoints {
+			if remote.addr == newEndpoint {
+				find = true
+				break
+			}
+		}
+		if !find {
+			delList = append(delList, remote.addr)
+		}
+	}
+	fmt.Printf("delList:%v\n", delList)
+
+	for _, addr_ := range addList {
+		endpoint := parseEndpoint(addr_)
+		tp.remotes = append(tp.remotes, &remote{srv: endpoint, addr: addr_})
+	}
+
+	tp.cancelSig[0] = make(chan struct{})
+	tp.cancelSig[1] = make(chan struct{})
+	go tp.runPendingHandler(delList, tp.cancelSig[0], tp.cancelSig[1])
 }
